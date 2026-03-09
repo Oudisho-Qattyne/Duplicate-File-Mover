@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-Duplicate File Mover – Tkinter GUI (Default Theme)
-
-A graphical tool to find duplicate files between two folders and move them
-from a source folder to a destination folder, preserving subfolder structure.
-Supports name+size and content‑only modes, optional hash verification,
-and dry‑runs. All heavy work runs in a background thread so the GUI stays responsive.
+Duplicate File Mover – Tkinter GUI with format filter, internal source & reference duplicates
 """
 
 import os
@@ -22,7 +17,20 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 
 # ----------------------------------------------------------------------
-# Core duplicate detection functions (same as before)
+# Predefined file format categories (extensions with dot)
+# ----------------------------------------------------------------------
+FORMAT_CATEGORIES = {
+    "Images": ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'],
+    "Documents": ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx', '.csv'],
+    "Audio": ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a'],
+    "Video": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm'],
+    "Archives": ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2'],
+    "Code": ['.py', '.js', '.html', '.css', '.cpp', '.java', '.php', '.rb', '.go', '.rs'],
+    "Other": ['.exe', '.dll', '.iso', '.img']
+}
+
+# ----------------------------------------------------------------------
+# Core duplicate detection functions
 # ----------------------------------------------------------------------
 def compute_file_hash(filepath, algorithm='md5', chunk_size=8192):
     hasher = hashlib.new(algorithm)
@@ -31,23 +39,35 @@ def compute_file_hash(filepath, algorithm='md5', chunk_size=8192):
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def build_index_memory(ref_folder, method, use_hash, hash_algo, progress_callback=None, cancel_flag=None):
+def matches_format(filename, formats):
+    """Return True if filename's extension is in the list of formats."""
+    if not formats:
+        return True
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in formats
+
+def build_index_memory(folder, method, use_hash, hash_algo, formats,
+                       progress_callback=None, cancel_flag=None):
     if method == 'name-size':
         index = defaultdict(list)
     else:
         index = defaultdict(lambda: defaultdict(list))
 
-    ref_folder = os.path.abspath(ref_folder)
+    folder = os.path.abspath(folder)
     total_files = 0
-    # First count files for progress
-    for root, dirs, files in os.walk(ref_folder):
-        total_files += len(files)
+    # Count files that match format for progress
+    for root, dirs, files in os.walk(folder):
+        for file in files:
+            if matches_format(file, formats):
+                total_files += 1
     processed = 0
 
-    for root, dirs, files in os.walk(ref_folder):
+    for root, dirs, files in os.walk(folder):
         if cancel_flag and cancel_flag():
             return None
         for file in files:
+            if not matches_format(file, formats):
+                continue
             processed += 1
             if progress_callback:
                 progress_callback(processed, total_files)
@@ -66,93 +86,149 @@ def build_index_memory(ref_folder, method, use_hash, hash_algo, progress_callbac
                     progress_callback(msg=f"Warning: {full_path} – {e}")
     return index
 
-def find_duplicates_memory(source_folder, index, method, use_hash, hash_algo, destination,
+def find_duplicates_memory(source_folder, ref_index, method, use_hash, hash_algo,
+                           destination, formats, internal_src=False,
                            progress_callback=None, cancel_flag=None):
-    duplicates = []
+    duplicates = set()
     source_folder = os.path.abspath(source_folder)
+
+    # Build source index if internal duplicates requested
+    src_index = None
+    if internal_src:
+        src_index = build_index_memory(source_folder, method, use_hash, hash_algo, formats,
+                                       progress_callback=None, cancel_flag=cancel_flag)
+        if src_index is None:
+            return None
+
     # Count files for progress
-    total_files = sum(len(files) for _, _, files in os.walk(source_folder))
+    total_files = 0
+    for root, dirs, files in os.walk(source_folder):
+        for file in files:
+            if matches_format(file, formats):
+                total_files += 1
     scanned = 0
 
     for root, dirs, files in os.walk(source_folder):
         if cancel_flag and cancel_flag():
             return None
         for file in files:
+            if not matches_format(file, formats):
+                continue
             scanned += 1
             if progress_callback:
                 progress_callback(scanned, total_files)
             source_path = os.path.join(root, file)
             try:
                 size = os.path.getsize(source_path)
+                is_duplicate = False
+
+                # Check against reference index
                 if method == 'name-size':
                     key = (file, size)
-                    if key not in index:
-                        continue
-                    candidates = index[key]
-                    if not use_hash:
-                        rel_path = os.path.relpath(source_path, source_folder)
-                        dest_path = os.path.join(destination, rel_path)
-                        duplicates.append((source_path, dest_path))
-                        if progress_callback:
-                            progress_callback(msg=f"Found duplicate: {source_path}")
-                        continue
-                    source_hash = compute_file_hash(source_path, hash_algo)
-                    for cand_path, cand_hash in candidates:
-                        if cand_hash is None:
-                            cand_hash = compute_file_hash(cand_path, hash_algo)
-                        if source_hash == cand_hash:
-                            rel_path = os.path.relpath(source_path, source_folder)
-                            dest_path = os.path.join(destination, rel_path)
-                            duplicates.append((source_path, dest_path))
-                            if progress_callback:
-                                progress_callback(msg=f"Found duplicate: {source_path}")
-                            break
+                    if key in ref_index:
+                        candidates = ref_index[key]
+                        if not use_hash:
+                            is_duplicate = True
+                        else:
+                            source_hash = compute_file_hash(source_path, hash_algo)
+                            for cand_path, cand_hash in candidates:
+                                if cand_hash is None:
+                                    cand_hash = compute_file_hash(cand_path, hash_algo)
+                                if source_hash == cand_hash:
+                                    is_duplicate = True
+                                    break
                 else:  # content
-                    if size not in index:
-                        continue
-                    source_hash = compute_file_hash(source_path, hash_algo)
-                    if source_hash in index[size]:
-                        rel_path = os.path.relpath(source_path, source_folder)
-                        dest_path = os.path.join(destination, rel_path)
-                        duplicates.append((source_path, dest_path))
-                        if progress_callback:
-                            progress_callback(msg=f"Found duplicate: {source_path}")
+                    if size in ref_index:
+                        source_hash = compute_file_hash(source_path, hash_algo)
+                        if source_hash in ref_index[size]:
+                            is_duplicate = True
+
+                # If not duplicate by reference, check internal source duplicates
+                if not is_duplicate and internal_src and src_index:
+                    if method == 'name-size':
+                        key = (file, size)
+                        if key in src_index and len(src_index[key]) > 1:
+                            if not use_hash:
+                                is_duplicate = True
+                            else:
+                                source_hash = compute_file_hash(source_path, hash_algo)
+                                for cand_path, cand_hash in src_index[key]:
+                                    if cand_path == source_path:
+                                        continue
+                                    if cand_hash is None:
+                                        cand_hash = compute_file_hash(cand_path, hash_algo)
+                                    if source_hash == cand_hash:
+                                        is_duplicate = True
+                                        break
+                    else:  # content
+                        if size in src_index:
+                            source_hash = compute_file_hash(source_path, hash_algo)
+                            if source_hash in src_index[size] and len(src_index[size][source_hash]) > 1:
+                                is_duplicate = True
+
+                if is_duplicate:
+                    rel_path = os.path.relpath(source_path, source_folder)
+                    dest_path = os.path.join(destination, rel_path)
+                    duplicates.add((source_path, dest_path))
+                    if progress_callback:
+                        progress_callback(msg=f"Found duplicate: {source_path}")
+
             except (OSError, PermissionError) as e:
                 if progress_callback:
                     progress_callback(msg=f"Warning: Cannot process {source_path}: {e}")
-    return duplicates
+
+    return list(duplicates)
 
 def init_db(db_path):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
+    # Tables for reference
     c.execute('''CREATE TABLE IF NOT EXISTS files_name_size
                  (name TEXT, size INTEGER, path TEXT, hash TEXT)''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_name_size ON files_name_size (name, size)')
     c.execute('''CREATE TABLE IF NOT EXISTS files_content
                  (size INTEGER, hash TEXT, path TEXT)''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_size_hash ON files_content (size, hash)')
+    # Tables for source (internal duplicates)
+    c.execute('''CREATE TABLE IF NOT EXISTS source_name_size
+                 (name TEXT, size INTEGER, path TEXT, hash TEXT)''')
+    c.execute('CREATE INDEX IF NOT EXISTS src_idx_name_size ON source_name_size (name, size)')
+    c.execute('''CREATE TABLE IF NOT EXISTS source_content
+                 (size INTEGER, hash TEXT, path TEXT)''')
+    c.execute('CREATE INDEX IF NOT EXISTS src_idx_size_hash ON source_content (size, hash)')
     conn.commit()
     return conn
 
-def build_index_db(ref_folder, db_path, method, use_hash, hash_algo,
-                   progress_callback=None, cancel_flag=None):
-    conn = init_db(db_path)
+def build_index_db(folder, db_path, method, use_hash, hash_algo, formats,
+                   table_prefix='', progress_callback=None, cancel_flag=None):
+    """Build index in SQLite database with optional table prefix."""
+    conn = init_db(db_path) if not table_prefix else sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute("DELETE FROM files_name_size")
-    c.execute("DELETE FROM files_content")
+    # Clear existing data in the relevant tables
+    if method == 'name-size':
+        c.execute(f"DELETE FROM {table_prefix}name_size")
+    else:
+        c.execute(f"DELETE FROM {table_prefix}content")
     conn.commit()
 
-    ref_folder = os.path.abspath(ref_folder)
+    folder = os.path.abspath(folder)
     batch = []
     batch_size = 1000
-    total_files = sum(len(files) for _, _, files in os.walk(ref_folder))
+    # Count files for progress
+    total_files = 0
+    for root, dirs, files in os.walk(folder):
+        for file in files:
+            if matches_format(file, formats):
+                total_files += 1
     processed = 0
 
-    for root, dirs, files in os.walk(ref_folder):
+    for root, dirs, files in os.walk(folder):
         if cancel_flag and cancel_flag():
             conn.close()
             return None
         for file in files:
+            if not matches_format(file, formats):
+                continue
             processed += 1
             if progress_callback:
                 progress_callback(processed, total_files)
@@ -167,9 +243,9 @@ def build_index_db(ref_folder, db_path, method, use_hash, hash_algo,
                     batch.append((size, h, full_path))
                 if len(batch) >= batch_size:
                     if method == 'name-size':
-                        c.executemany("INSERT INTO files_name_size VALUES (?,?,?,?)", batch)
+                        c.executemany(f"INSERT INTO {table_prefix}name_size VALUES (?,?,?,?)", batch)
                     else:
-                        c.executemany("INSERT INTO files_content VALUES (?,?,?)", batch)
+                        c.executemany(f"INSERT INTO {table_prefix}content VALUES (?,?,?)", batch)
                     conn.commit()
                     batch.clear()
             except (OSError, PermissionError) as e:
@@ -177,64 +253,193 @@ def build_index_db(ref_folder, db_path, method, use_hash, hash_algo,
                     progress_callback(msg=f"Warning: {full_path} – {e}")
     if batch:
         if method == 'name-size':
-            c.executemany("INSERT INTO files_name_size VALUES (?,?,?,?)", batch)
+            c.executemany(f"INSERT INTO {table_prefix}name_size VALUES (?,?,?,?)", batch)
         else:
-            c.executemany("INSERT INTO files_content VALUES (?,?,?)", batch)
+            c.executemany(f"INSERT INTO {table_prefix}content VALUES (?,?,?)", batch)
         conn.commit()
     return conn
 
-def find_duplicates_db(source_folder, conn, method, use_hash, hash_algo, destination,
+def find_duplicates_db(source_folder, conn, method, use_hash, hash_algo,
+                       destination, formats, internal_src=False,
                        progress_callback=None, cancel_flag=None):
-    duplicates = []
+    duplicates = set()
     source_folder = os.path.abspath(source_folder)
     c = conn.cursor()
-    total_files = sum(len(files) for _, _, files in os.walk(source_folder))
+
+    # If internal duplicates requested, build source index in the same DB (different tables)
+    if internal_src:
+        src_conn = build_index_db(source_folder, os.path.abspath(conn.execute("PRAGMA database").fetchone()[0]),
+                                  method, use_hash, hash_algo, formats,
+                                  table_prefix='source_', progress_callback=None, cancel_flag=cancel_flag)
+        if src_conn is None:
+            return None
+    else:
+        src_conn = None
+
+    # Count files in source for progress
+    total_files = 0
+    for root, dirs, files in os.walk(source_folder):
+        for file in files:
+            if matches_format(file, formats):
+                total_files += 1
     scanned = 0
 
     for root, dirs, files in os.walk(source_folder):
         if cancel_flag and cancel_flag():
             return None
         for file in files:
+            if not matches_format(file, formats):
+                continue
             scanned += 1
             if progress_callback:
                 progress_callback(scanned, total_files)
             source_path = os.path.join(root, file)
             try:
                 size = os.path.getsize(source_path)
+                is_duplicate = False
+
+                # Check reference tables
                 if method == 'name-size':
                     if not use_hash:
                         c.execute("SELECT 1 FROM files_name_size WHERE name=? AND size=? LIMIT 1",
                                   (file, size))
                         if c.fetchone():
-                            rel_path = os.path.relpath(source_path, source_folder)
-                            dest_path = os.path.join(destination, rel_path)
-                            duplicates.append((source_path, dest_path))
-                            if progress_callback:
-                                progress_callback(msg=f"Found duplicate: {source_path}")
+                            is_duplicate = True
                     else:
                         source_hash = compute_file_hash(source_path, hash_algo)
                         c.execute("SELECT 1 FROM files_name_size WHERE name=? AND size=? AND hash=? LIMIT 1",
                                   (file, size, source_hash))
                         if c.fetchone():
-                            rel_path = os.path.relpath(source_path, source_folder)
-                            dest_path = os.path.join(destination, rel_path)
-                            duplicates.append((source_path, dest_path))
-                            if progress_callback:
-                                progress_callback(msg=f"Found duplicate: {source_path}")
+                            is_duplicate = True
                 else:  # content
                     source_hash = compute_file_hash(source_path, hash_algo)
                     c.execute("SELECT 1 FROM files_content WHERE size=? AND hash=? LIMIT 1",
                               (size, source_hash))
                     if c.fetchone():
-                        rel_path = os.path.relpath(source_path, source_folder)
-                        dest_path = os.path.join(destination, rel_path)
-                        duplicates.append((source_path, dest_path))
-                        if progress_callback:
-                            progress_callback(msg=f"Found duplicate: {source_path}")
+                        is_duplicate = True
+
+                # If not duplicate by reference, check internal source duplicates
+                if not is_duplicate and internal_src and src_conn:
+                    src_c = src_conn.cursor()
+                    if method == 'name-size':
+                        if not use_hash:
+                            src_c.execute("SELECT COUNT(*) FROM source_name_size WHERE name=? AND size=?",
+                                          (file, size))
+                            count = src_c.fetchone()[0]
+                            if count > 1:
+                                is_duplicate = True
+                        else:
+                            source_hash = compute_file_hash(source_path, hash_algo)
+                            src_c.execute("SELECT COUNT(*) FROM source_name_size WHERE name=? AND size=? AND hash=?",
+                                          (file, size, source_hash))
+                            count = src_c.fetchone()[0]
+                            if count > 1:
+                                is_duplicate = True
+                    else:  # content
+                        source_hash = compute_file_hash(source_path, hash_algo)
+                        src_c.execute("SELECT COUNT(*) FROM source_content WHERE size=? AND hash=?",
+                                      (size, source_hash))
+                        count = src_c.fetchone()[0]
+                        if count > 1:
+                            is_duplicate = True
+
+                if is_duplicate:
+                    rel_path = os.path.relpath(source_path, source_folder)
+                    dest_path = os.path.join(destination, rel_path)
+                    duplicates.add((source_path, dest_path))
+                    if progress_callback:
+                        progress_callback(msg=f"Found duplicate: {source_path}")
+
             except (OSError, PermissionError) as e:
                 if progress_callback:
                     progress_callback(msg=f"Warning: Cannot process {source_path}: {e}")
-    return duplicates
+
+    if src_conn:
+        src_conn.close()
+    return list(duplicates)
+
+def find_internal_duplicates_memory(index, method, use_hash, hash_algo, folder_path,
+                                     progress_callback=None, cancel_flag=None):
+    """Log internal duplicates found in an in‑memory index (no moving)."""
+    count = 0
+    if method == 'name-size':
+        for key, paths_hashes in index.items():
+            if cancel_flag and cancel_flag():
+                return
+            if len(paths_hashes) > 1:
+                if not use_hash:
+                    # All files with same name+size are duplicates
+                    paths = [p for p, _ in paths_hashes]
+                    count += 1
+                    if progress_callback:
+                        progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+                else:
+                    # Group by hash
+                    hash_groups = defaultdict(list)
+                    for path, h in paths_hashes:
+                        if h is None:
+                            h = compute_file_hash(path, hash_algo)
+                        hash_groups[h].append(path)
+                    for h, paths in hash_groups.items():
+                        if len(paths) > 1:
+                            count += 1
+                            if progress_callback:
+                                progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+    else:  # content mode: index is size -> {hash: [paths]}
+        for size, hash_dict in index.items():
+            if cancel_flag and cancel_flag():
+                return
+            for h, paths in hash_dict.items():
+                if len(paths) > 1:
+                    count += 1
+                    if progress_callback:
+                        progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+    if count > 0 and progress_callback:
+        progress_callback(msg=f"Found {count} internal duplicate sets in {os.path.basename(folder_path)}.")
+
+def find_internal_duplicates_db(conn, method, use_hash, hash_algo, folder_path, table_prefix,
+                                 progress_callback=None, cancel_flag=None):
+    """Log internal duplicates from SQLite tables."""
+    c = conn.cursor()
+    count = 0
+    if method == 'name-size':
+        # First, find groups with same name+size and more than one file
+        if not use_hash:
+            c.execute(f"SELECT name, size, COUNT(*) FROM {table_prefix}name_size GROUP BY name, size HAVING COUNT(*) > 1")
+            groups = c.fetchall()
+            for name, size, cnt in groups:
+                if cancel_flag and cancel_flag():
+                    return
+                c.execute(f"SELECT path FROM {table_prefix}name_size WHERE name=? AND size=? LIMIT 2", (name, size))
+                paths = [row[0] for row in c.fetchall()]
+                count += 1
+                if progress_callback:
+                    progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+        else:
+            # Need to group by name, size, hash
+            c.execute(f"SELECT name, size, hash, COUNT(*) FROM {table_prefix}name_size GROUP BY name, size, hash HAVING COUNT(*) > 1")
+            groups = c.fetchall()
+            for name, size, h, cnt in groups:
+                if cancel_flag and cancel_flag():
+                    return
+                c.execute(f"SELECT path FROM {table_prefix}name_size WHERE name=? AND size=? AND hash=? LIMIT 2", (name, size, h))
+                paths = [row[0] for row in c.fetchall()]
+                count += 1
+                if progress_callback:
+                    progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+    else:  # content
+        c.execute(f"SELECT size, hash, COUNT(*) FROM {table_prefix}content GROUP BY size, hash HAVING COUNT(*) > 1")
+        groups = c.fetchall()
+        for size, h, cnt in groups:
+            if cancel_flag and cancel_flag():
+                return
+            c.execute(f"SELECT path FROM {table_prefix}content WHERE size=? AND hash=? LIMIT 2", (size, h))
+            paths = [row[0] for row in c.fetchall()]
+            count += 1
+            if progress_callback:
+                progress_callback(msg=f"Internal duplicate in {os.path.basename(folder_path)}: {paths[0]} and {paths[1]}")
+    if count > 0 and progress_callback:
+        progress_callback(msg=f"Found {count} internal duplicate sets in {os.path.basename(folder_path)}.")
 
 def move_duplicates(duplicates, dry_run, progress_callback=None, cancel_flag=None):
     total = len(duplicates)
@@ -258,11 +463,12 @@ def move_duplicates(duplicates, dry_run, progress_callback=None, cancel_flag=Non
                 progress_callback(msg=f"[DRY RUN] Would move: {src} -> {dst}")
 
 # ----------------------------------------------------------------------
-# Worker thread that runs the duplicate detection/moving
+# Worker thread
 # ----------------------------------------------------------------------
 class DuplicateWorker(threading.Thread):
     def __init__(self, queue, source, reference, destination, method,
-                 use_hash, hash_algo, dry_run, use_db):
+                 use_hash, hash_algo, dry_run, use_db, formats,
+                 internal_src, internal_ref):
         super().__init__()
         self.queue = queue
         self.source = source
@@ -273,13 +479,15 @@ class DuplicateWorker(threading.Thread):
         self.hash_algo = hash_algo
         self.dry_run = dry_run
         self.use_db = use_db
+        self.formats = formats
+        self.internal_src = internal_src
+        self.internal_ref = internal_ref
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def progress_callback(self, current=None, total=None, msg=None):
-        """Send progress updates to the GUI via queue."""
         if msg is not None:
             self.queue.put(('msg', msg))
         if current is not None and total is not None:
@@ -290,40 +498,53 @@ class DuplicateWorker(threading.Thread):
             # Phase 1: Build reference index
             self.progress_callback(msg="Building reference index...")
             if self.use_db:
-                conn = build_index_db(
-                    self.reference, self.use_db, self.method, self.use_hash, self.hash_algo,
-                    progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel
+                ref_conn = build_index_db(
+                    self.reference, self.use_db, self.method, self.use_hash, self.hash_algo, self.formats,
+                    table_prefix='files_', progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel
                 )
-                if conn is None:  # cancelled
+                if ref_conn is None:
                     self.queue.put(('finished',))
                     return
+                # Optionally find internal duplicates in reference
+                if self.internal_ref:
+                    self.progress_callback(msg="Checking for internal duplicates in reference folder...")
+                    find_internal_duplicates_db(ref_conn, self.method, self.use_hash, self.hash_algo,
+                                                 self.reference, 'files_',
+                                                 progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel)
             else:
-                index = build_index_memory(
-                    self.reference, self.method, self.use_hash, self.hash_algo,
+                ref_index = build_index_memory(
+                    self.reference, self.method, self.use_hash, self.hash_algo, self.formats,
                     progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel
                 )
-                if index is None:
+                if ref_index is None:
                     self.queue.put(('finished',))
                     return
+                if self.internal_ref:
+                    self.progress_callback(msg="Checking for internal duplicates in reference folder...")
+                    find_internal_duplicates_memory(ref_index, self.method, self.use_hash, self.hash_algo,
+                                                     self.reference,
+                                                     progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel)
 
-            # Phase 2: Scan source for duplicates
+            # Phase 2: Scan source for duplicates to move
             self.progress_callback(msg="Scanning source folder for duplicates...")
             if self.use_db:
                 duplicates = find_duplicates_db(
-                    self.source, conn, self.method, self.use_hash, self.hash_algo, self.destination,
+                    self.source, ref_conn, self.method, self.use_hash, self.hash_algo, self.destination,
+                    self.formats, self.internal_src,
                     progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel
                 )
-                conn.close()
+                ref_conn.close()
             else:
                 duplicates = find_duplicates_memory(
-                    self.source, index, self.method, self.use_hash, self.hash_algo, self.destination,
+                    self.source, ref_index, self.method, self.use_hash, self.hash_algo, self.destination,
+                    self.formats, self.internal_src,
                     progress_callback=self.progress_callback, cancel_flag=lambda: self._cancel
                 )
             if duplicates is None:
                 self.queue.put(('finished',))
                 return
 
-            self.progress_callback(msg=f"Found {len(duplicates)} duplicate files.")
+            self.progress_callback(msg=f"Found {len(duplicates)} duplicate files to move.")
             if not duplicates:
                 self.queue.put(('finished',))
                 return
@@ -341,16 +562,15 @@ class DuplicateWorker(threading.Thread):
             self.queue.put(('finished',))
 
 # ----------------------------------------------------------------------
-# Main GUI Application (Default Theme)
+# GUI Application
 # ----------------------------------------------------------------------
 class DuplicateMoverApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Duplicate File Mover")
-        self.root.geometry("800x600")
-        self.root.minsize(700, 500)
+        self.root.geometry("850x750")
+        self.root.minsize(750, 650)
 
-        # Use a modern theme if available (without custom colors)
         style = ttk.Style()
         available_themes = style.theme_names()
         if 'clam' in available_themes:
@@ -359,9 +579,7 @@ class DuplicateMoverApp:
             style.theme_use('vista')
         elif 'alt' in available_themes:
             style.theme_use('alt')
-        # No custom color overrides – use system defaults
 
-        # Main container
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -423,6 +641,16 @@ class DuplicateMoverApp:
                                    state="readonly", width=8)
         algo_combo.pack(side=tk.LEFT)
 
+        # Internal duplicates checkboxes
+        internal_frame = ttk.Frame(options_frame)
+        internal_frame.pack(fill=tk.X, pady=2)
+        self.internal_src_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(internal_frame, text="Find internal duplicates in source folder (files to move)",
+                        variable=self.internal_src_var).pack(side=tk.LEFT, padx=5)
+        self.internal_ref_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(internal_frame, text="Find internal duplicates in reference folder (log only, no move)",
+                        variable=self.internal_ref_var).pack(side=tk.LEFT, padx=5)
+
         # Database option
         db_frame = ttk.Frame(options_frame)
         db_frame.pack(fill=tk.X, pady=2)
@@ -440,6 +668,39 @@ class DuplicateMoverApp:
         self.dry_run_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(options_frame, text="Dry run (preview only, no files moved)",
                         variable=self.dry_run_var).pack(anchor=tk.W, padx=5, pady=2)
+
+        # --- File type selection (categories) ---
+        type_frame = ttk.LabelFrame(main_frame, text="File Types to Process", padding="5")
+        type_frame.pack(fill=tk.X, pady=5)
+
+        # Container for checkboxes
+        cb_container = ttk.Frame(type_frame)
+        cb_container.pack(fill=tk.X, pady=2)
+
+        self.category_vars = {}
+        categories = list(FORMAT_CATEGORIES.keys())
+        # Arrange in 3 columns
+        for i, cat in enumerate(categories):
+            var = tk.BooleanVar(value=False)
+            self.category_vars[cat] = var
+            cb = ttk.Checkbutton(cb_container, text=cat, variable=var)
+            row = i // 3
+            col = i % 3
+            cb.grid(row=row, column=col, sticky='w', padx=10, pady=2)
+
+        # "Other extensions" entry (for custom types)
+        other_frame = ttk.Frame(type_frame)
+        other_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(other_frame, text="Other extensions (comma separated, e.g. .dat,.log):").pack(side=tk.LEFT, padx=5)
+        self.other_formats_var = tk.StringVar()
+        other_entry = ttk.Entry(other_frame, textvariable=self.other_formats_var)
+        other_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Select/Clear all buttons
+        btn_sel_frame = ttk.Frame(type_frame)
+        btn_sel_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_sel_frame, text="Select All", command=self.select_all_types).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_sel_frame, text="Clear All", command=self.clear_all_types).pack(side=tk.LEFT, padx=5)
 
         # --- Buttons ---
         btn_frame = ttk.Frame(main_frame)
@@ -459,7 +720,6 @@ class DuplicateMoverApp:
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 10))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        # Queue for thread communication
         self.queue = queue.Queue()
         self.worker = None
         self.check_queue()
@@ -476,7 +736,6 @@ class DuplicateMoverApp:
             self.db_var.set(file)
 
     def update_ui(self):
-        """Enable/disable widgets based on selections."""
         method = self.method_var.get()
         if method == 'content':
             self.use_hash_cb.config(state='disabled')
@@ -490,9 +749,34 @@ class DuplicateMoverApp:
             self.db_entry.config(state='disabled')
             self.db_btn.config(state='disabled')
 
+    def select_all_types(self):
+        for var in self.category_vars.values():
+            var.set(True)
+
+    def clear_all_types(self):
+        for var in self.category_vars.values():
+            var.set(False)
+
     def log_message(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
+
+    def get_selected_formats(self):
+        """Return list of selected extensions (from categories + custom)."""
+        formats = []
+        # Add extensions from checked categories
+        for cat, var in self.category_vars.items():
+            if var.get():
+                formats.extend(FORMAT_CATEGORIES[cat])
+        # Add custom extensions
+        other = self.other_formats_var.get().strip()
+        if other:
+            parts = [p.strip().lower() for p in other.split(',') if p.strip()]
+            for p in parts:
+                if not p.startswith('.'):
+                    p = '.' + p
+                formats.append(p)
+        return formats
 
     def start_processing(self):
         # Validate inputs
@@ -508,24 +792,26 @@ class DuplicateMoverApp:
         if not os.path.isdir(ref):
             self.log_message("Error: Reference folder does not exist.")
             return
-        # Destination will be created if needed
 
         method = self.method_var.get()
-        use_hash = self.use_hash_var.get() if method == 'name-size' else True  # content mode always uses hash
+        use_hash = self.use_hash_var.get() if method == 'name-size' else True
         hash_algo = self.algo_var.get()
         dry_run = self.dry_run_var.get()
         use_db = self.db_var.get().strip() if self.use_db_var.get() else None
 
-        # Disable start, enable cancel
+        formats = self.get_selected_formats()
+        internal_src = self.internal_src_var.get()
+        internal_ref = self.internal_ref_var.get()
+
         self.start_btn.config(state='disabled')
         self.cancel_btn.config(state='normal')
         self.progress['value'] = 0
-        self.progress['maximum'] = 100  # will be updated by worker
+        self.progress['maximum'] = 100
         self.log_text.delete(1.0, tk.END)
 
-        # Start worker thread
         self.worker = DuplicateWorker(
-            self.queue, src, ref, dst, method, use_hash, hash_algo, dry_run, use_db
+            self.queue, src, ref, dst, method, use_hash, hash_algo, dry_run, use_db,
+            formats, internal_src, internal_ref
         )
         self.worker.start()
 
@@ -535,7 +821,6 @@ class DuplicateMoverApp:
             self.log_message("Cancelling... (please wait)")
 
     def check_queue(self):
-        """Check for messages from the worker thread and update GUI."""
         try:
             while True:
                 msg = self.queue.get_nowait()
